@@ -1,5 +1,6 @@
 """Tests for LangfuseProvider — mocked Langfuse SDK."""
 
+import json
 import os
 from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,7 @@ from strands_evals.types.trace import (
     AgentInvocationSpan,
     InferenceSpan,
     Session,
+    ToolCallContent,
     ToolExecutionSpan,
 )
 
@@ -174,10 +176,62 @@ class TestGetEvaluationData:
         mock_client.api.trace.list.assert_not_called()
         kwargs = mock_client.api.observations.get_many.call_args[1]
         assert kwargs["session_id"] == "s1"
-        assert kwargs["parse_io_as_json"] is True
+        # Langfuse v4 rejects parseIoAsJson=true on the v2 observations endpoint
+        assert "parse_io_as_json" not in kwargs
         assert set(kwargs["fields"].split(",")) >= {"core", "basic", "io", "metadata"}
         assert kwargs["expand_metadata"] == "tools"
         assert kwargs["cursor"] is None
+
+    def test_decodes_json_string_io(self, provider, mock_client):
+        """The v2 observations API returns input and output as raw JSON strings."""
+        mock_client.api.observations.get_many.return_value = _paginated(
+            [
+                _obs(
+                    "o-agent",
+                    "t1",
+                    "AGENT",
+                    name="agent_abc",
+                    obs_input=json.dumps({"messages": [{"type": "human", "content": "Compare A and B"}]}),
+                    obs_output=json.dumps({"messages": [{"type": "ai", "content": "Which KPI?"}]}),
+                ),
+                _obs(
+                    "o-gen",
+                    "t1",
+                    "GENERATION",
+                    name="ChatAnthropic",
+                    obs_input=json.dumps([{"role": "user", "content": "Compare A and B"}]),
+                    obs_output=json.dumps(
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [{"name": "skill", "args": {"skillName": "kpi"}, "id": "c1"}],
+                        }
+                    ),
+                    parent_observation_id="o-agent",
+                    start_time=datetime(2025, 1, 15, 10, 0, 1, tzinfo=timezone.utc),
+                ),
+                _obs(
+                    "o-tool",
+                    "t1",
+                    "TOOL",
+                    name="skill",
+                    obs_input=json.dumps({"skillName": "kpi"}),
+                    obs_output="plain text result",
+                    parent_observation_id="o-agent",
+                    start_time=datetime(2025, 1, 15, 10, 0, 2, tzinfo=timezone.utc),
+                ),
+            ]
+        )
+        result = provider.get_evaluation_data("s1")
+        agent, inference, tool = result["trajectory"].traces[0].spans
+
+        assert agent.user_prompt == "Compare A and B"
+        assert result["output"] == "Which KPI?"
+        tool_calls = [c for c in inference.messages[-1].content if isinstance(c, ToolCallContent)]
+        assert tool_calls[0].name == "skill"
+        assert tool_calls[0].arguments == {"skillName": "kpi"}
+        assert tool.tool_call.arguments == {"skillName": "kpi"}
+        assert tool.tool_result.content == "plain text result"
 
     def test_empty_session_raises(self, provider, mock_client):
         mock_client.api.observations.get_many.return_value = _paginated([])

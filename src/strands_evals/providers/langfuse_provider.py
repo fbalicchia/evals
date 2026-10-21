@@ -47,6 +47,22 @@ _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 2
 
 
+def _decode_io(value: Any) -> Any:
+    """Decode an observation's input or output when it arrives as a JSON string.
+
+    The v2 observations API always returns input and output as raw strings, so a
+    message list or dict comes back JSON-encoded. Strings that are not JSON, or that
+    decode to a scalar such as a number, are returned unchanged.
+    """
+    if not isinstance(value, str):
+        return value
+    try:
+        decoded = json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        return value
+    return decoded if isinstance(decoded, (dict, list, str)) else value
+
+
 class LangfuseProvider(TraceProvider):
     """Retrieves agent trace data from Langfuse for evaluation.
 
@@ -137,8 +153,8 @@ class LangfuseProvider(TraceProvider):
 
         Queries the v2 observations API by session directly instead of listing traces
         first: Langfuse v4 servers on the events-only data model have no `/traces` endpoint.
-        Input and output are parsed as JSON server-side, so converters receive dicts and
-        lists rather than JSON strings.
+        The API returns input and output as raw strings; converters decode them with
+        `_decode_io`.
         """
         observations: list[Any] = []
         cursor: str | None = None
@@ -148,7 +164,6 @@ class LangfuseProvider(TraceProvider):
                 session_id=session_id,
                 fields=_OBSERVATION_FIELDS,
                 expand_metadata=_EXPANDED_METADATA_KEYS,
-                parse_io_as_json=True,
                 limit=_PAGE_SIZE,
                 cursor=cursor,
             )
@@ -302,7 +317,7 @@ class LangfuseProvider(TraceProvider):
         messages: list[UserMessage | AssistantMessage] = []
 
         # Process input messages
-        obs_input = obs.input
+        obs_input = _decode_io(obs.input)
         if isinstance(obs_input, list):
             for msg in obs_input:
                 if isinstance(msg, dict):
@@ -311,7 +326,7 @@ class LangfuseProvider(TraceProvider):
                         messages.append(converted)
 
         # Process output message
-        obs_output = obs.output
+        obs_output = _decode_io(obs.output)
         if isinstance(obs_output, dict):
             converted = self._convert_message(obs_output)
             if converted:
@@ -467,7 +482,7 @@ class LangfuseProvider(TraceProvider):
             obs.output: `{"message": "<JSON string of [{\"text\": ...}]>", "id": "tooluse_..."}`
         """
         span_info = self._create_span_info(obs, session_id)
-        obs_input = obs.input or {}
+        obs_input = _decode_io(obs.input) or {}
 
         if isinstance(obs_input, dict) and "name" in obs_input:
             # Strands format: input carries name/arguments/toolUseId
@@ -499,7 +514,7 @@ class LangfuseProvider(TraceProvider):
             tool_arguments = {}
             tool_call_id = None
 
-        result_content, result_error = self._parse_tool_result(obs.output)
+        result_content, result_error = self._parse_tool_result(_decode_io(obs.output))
         tool_call = ToolCall(name=tool_name, arguments=tool_arguments, tool_call_id=tool_call_id)
         tool_result = ToolResult(content=result_content, error=result_error, tool_call_id=tool_call_id)
 
@@ -599,8 +614,8 @@ class LangfuseProvider(TraceProvider):
             obs.output: ``{"output": "answer"}`` or ``{"content": "answer"}``
         """
         span_info = self._create_span_info(obs, session_id)
-        obs_input = obs.input
-        obs_output = obs.output
+        obs_input = _decode_io(obs.input)
+        obs_output = _decode_io(obs.output)
 
         # Extract user prompt from input
         user_prompt = self._extract_user_prompt(obs_input)
