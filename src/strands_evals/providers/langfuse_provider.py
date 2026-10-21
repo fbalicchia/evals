@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+from collections import defaultdict
 from collections.abc import Callable
 from typing import Any
 
@@ -37,6 +38,10 @@ from .trace_provider import TraceProvider
 logger = logging.getLogger(__name__)
 
 _PAGE_SIZE = 100
+# Field groups of the v2 observations API that the converters read
+_OBSERVATION_FIELDS = "core,basic,io,metadata"
+# Metadata values over 200 chars come back truncated unless their key is listed here
+_EXPANDED_METADATA_KEYS = "tools"
 _DEFAULT_TIMEOUT = 120
 _MAX_RETRIES = 3
 _RETRY_BACKOFF_BASE = 2
@@ -105,16 +110,16 @@ class LangfuseProvider(TraceProvider):
     def get_evaluation_data(self, session_id: str) -> TaskOutput:
         """Fetch all traces for a session and return evaluation data."""
         try:
-            all_traces = self._fetch_traces_for_session(session_id)
+            observations = self._fetch_session_observations(session_id)
         except TraceProviderError:
             raise
         except Exception as e:
             raise ProviderError(f"Langfuse: failed to fetch traces for session '{session_id}': {e}") from e
 
-        if not all_traces:
+        if not observations:
             raise SessionNotFoundError(f"Langfuse: no traces found for session_id='{session_id}'")
 
-        session = self._build_session(session_id, all_traces)
+        session = self._build_session(session_id, observations)
 
         if not session.traces:
             raise SessionNotFoundError(
@@ -127,17 +132,30 @@ class LangfuseProvider(TraceProvider):
 
     # --- Internal: fetching ---
 
-    def _fetch_all_pages(self, fetch_fn: Callable[..., Any], **kwargs: Any) -> list[Any]:
-        """Fetch all pages from a paginated Langfuse API endpoint."""
-        all_items: list = []
-        page = 1
+    def _fetch_session_observations(self, session_id: str) -> list[Any]:
+        """Fetch every observation of a session, following the pagination cursor.
+
+        Queries the v2 observations API by session directly instead of listing traces
+        first: Langfuse v4 servers on the events-only data model have no `/traces` endpoint.
+        Input and output are parsed as JSON server-side, so converters receive dicts and
+        lists rather than JSON strings.
+        """
+        observations: list[Any] = []
+        cursor: str | None = None
         while True:
-            response = self._call_with_retry(fetch_fn, page=page, limit=_PAGE_SIZE, **kwargs)
-            all_items.extend(response.data)
-            if page >= response.meta.total_pages:
-                break
-            page += 1
-        return all_items
+            response = self._call_with_retry(
+                self._client.api.observations.get_many,
+                session_id=session_id,
+                fields=_OBSERVATION_FIELDS,
+                expand_metadata=_EXPANDED_METADATA_KEYS,
+                parse_io_as_json=True,
+                limit=_PAGE_SIZE,
+                cursor=cursor,
+            )
+            observations.extend(response.data)
+            cursor = response.meta.cursor
+            if not cursor:
+                return observations
 
     def _call_with_retry(self, fn: Callable[..., Any], **kwargs: Any) -> Any:
         """Call a Langfuse API function with timeout and retry on ReadTimeout."""
@@ -151,29 +169,24 @@ class LangfuseProvider(TraceProvider):
         )
         return retrier(fn, **kwargs)
 
-    def _fetch_traces_for_session(self, session_id: str) -> list:
-        """Fetch all trace metadata for a session, handling pagination."""
-        return self._fetch_all_pages(self._client.api.trace.list, session_id=session_id)
-
-    def _fetch_observations(self, trace_id: str) -> list[Any]:
-        """Fetch all observations for a trace, handling pagination."""
-        return self._fetch_all_pages(self._client.api.observations.get_many, trace_id=trace_id)
-
     # --- Internal: building Session ---
 
-    def _build_session(self, session_id: str, langfuse_traces: list[Any]) -> Session:
-        """Fetch observations for each Langfuse trace and assemble a Session.
+    def _build_session(self, session_id: str, observations: list[Any]) -> Session:
+        """Group a session's observations by trace and assemble a Session.
 
-        For each trace, fetches all observations via the Langfuse API,
-        converts them to typed spans, and groups them into Trace objects.
-        Traces with no convertible observations are excluded.
+        Observations are ordered by start time, so traces follow the order of their
+        first observation and spans within a trace are chronological. Traces with no
+        convertible observations are excluded.
         """
+        observations_by_trace: dict[str, list[Any]] = defaultdict(list)
+        for obs in sorted(observations, key=lambda o: o.start_time):
+            observations_by_trace[obs.trace_id].append(obs)
+
         traces = []
-        for lf_trace in langfuse_traces:
-            observations = self._fetch_observations(lf_trace.id)
-            spans = self._convert_observations(observations, session_id)
+        for trace_id, trace_observations in observations_by_trace.items():
+            spans = self._convert_observations(trace_observations, session_id)
             if spans:
-                traces.append(Trace(trace_id=lf_trace.id, session_id=session_id, spans=spans))
+                traces.append(Trace(trace_id=trace_id, session_id=session_id, spans=spans))
         return Session(session_id=session_id, traces=traces)
 
     def _convert_observations(self, observations: list[Any], session_id: str) -> list[Any]:
