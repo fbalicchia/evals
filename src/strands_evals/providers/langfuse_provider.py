@@ -191,10 +191,13 @@ class LangfuseProvider(TraceProvider):
 
         Observations are ordered by start time, so traces follow the order of their
         first observation and spans within a trace are chronological. Traces with no
-        convertible observations are excluded.
+        convertible observations are excluded, and so are observations without a trace ID.
         """
         observations_by_trace: dict[str, list[Any]] = defaultdict(list)
         for obs in sorted(observations, key=lambda o: o.start_time):
+            if not obs.trace_id:
+                logger.debug("observation_id=<%s> | skipping observation without trace id", obs.id)
+                continue
             observations_by_trace[obs.trace_id].append(obs)
 
         traces = []

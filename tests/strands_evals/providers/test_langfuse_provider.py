@@ -328,6 +328,17 @@ class TestGetEvaluationData:
         with pytest.raises(SessionNotFoundError):
             provider.get_evaluation_data("s1")
 
+    def test_observations_without_trace_id_skipped(self, provider, mock_client):
+        mock_client.api.observations.get_many.return_value = _paginated(
+            [
+                _obs("o1", None, "SPAN", name="invoke_agent a", obs_input=[{"text": "q0"}], obs_output="orphan"),
+                _obs("o2", "t1", "SPAN", name="invoke_agent a", obs_input=[{"text": "q1"}], obs_output="a"),
+            ]
+        )
+        result = provider.get_evaluation_data("s1")
+        assert [t.trace_id for t in result["trajectory"].traces] == ["t1"]
+        assert result["output"] == "a"
+
 
 # --- Observation conversion ---
 
